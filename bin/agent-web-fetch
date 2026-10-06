@@ -1,0 +1,4 @@
+#!/bin/sh
+here="$(cd "$(dirname "$0")/.." && pwd)"
+if [ -x "$here/.venv/Scripts/python.exe" ]; then py="$here/.venv/Scripts/python.exe"; else py="$here/.venv/bin/python"; fi
+exec "$py" -I -m agent_web_fetch "$@"

@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-web-fetch"
+version = "0.1.0"
+description = "Fetch web pages as clean Markdown for LLM agents."
+requires-python = ">=3.10"
+dependencies = [
+    "httpx==0.28.1",
+    "camoufox==0.5.6",
+    "playwright==1.62.0",
+]
+
+[project.scripts]
+agent-web-fetch = "agent_web_fetch.cli:main"
+
+[tool.setuptools]
+packages = ["agent_web_fetch", "agent_web_fetch.backends"]
+
+[tool.setuptools.package-data]
+agent_web_fetch = ["browser_pins.json"]

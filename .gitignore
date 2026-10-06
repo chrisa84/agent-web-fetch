@@ -1,0 +1,30 @@
+# Virtual environment and build output
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# Runtime state (normally kept outside the repo, ignored here defensively)
+profiles/
+cache/
+tmp/
+logs/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+cookies*
+*.cookies
+
+# Secrets
+.env
+.env.*
+*.key
+*.pem
+secrets*
+
+# Claude Code
+CLAUDE*.md
+.claude/
