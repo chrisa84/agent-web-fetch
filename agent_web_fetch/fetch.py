@@ -14,6 +14,7 @@ from .backends import jina as jina_backend
 from .cache import DEFAULT_TTL, Cache
 from .extract import clean_markdown, clean_title, detect_failure
 from .security import URLRejected, validate_url
+from .snapshot import save_snapshot
 
 BACKENDS = ("auto", "jina", "browser")
 LEASE_SECONDS = 360.0  # covers both backends, challenge waiting and bounded retries
@@ -65,11 +66,17 @@ async def _acquire(cache: Cache, key: str) -> bool:
 async def fetch(url: str, backend: str = "auto", refresh: bool = False, allow_private: bool = False,
                 cache: Optional[Cache] = None, jina_key: Optional[str] = None, ttl: float = DEFAULT_TTL,
                 pool: Optional["camoufox_backend.BrowserPool"] = None,
-                no_stale: bool = False, max_wait: float = MAX_POLITE_WAIT) -> dict:
+                no_stale: bool = False, max_wait: float = MAX_POLITE_WAIT,
+                snapshot_dir: Optional[str] = None) -> dict:
     if backend not in BACKENDS:
         raise ValueError(f"unknown backend {backend}")
     if max_wait < 0 or not max_wait < float("inf"):
         raise ValueError("max_wait must be finite and non-negative")
+    if snapshot_dir is not None:
+        if backend == "jina":
+            raise ValueError("snapshot mode requires the browser; --backend jina is incompatible")
+        backend = "browser"
+        no_stale = True  # cached Markdown cannot supply a browser snapshot
     started = time.time()
     try:
         canonical = validate_url(url, allow_private)
@@ -97,7 +104,7 @@ async def fetch(url: str, backend: str = "auto", refresh: bool = False, allow_pr
 
     try:
         if not refresh:
-            hit = _from_cache(cache, url, canonical, backend, ttl)
+            hit = _from_cache(cache, url, canonical, backend, ttl, require_live=snapshot_dir is not None)
             if hit:
                 log_event(host=host, backend=hit["backend"], cache="hit", error=(hit["error"] or {}).get("category"))
                 return fallback(hit)
@@ -116,7 +123,8 @@ async def fetch(url: str, backend: str = "auto", refresh: bool = False, allow_pr
         if not await _acquire(cache, url_key):
             return fallback(_result(url, error={"category": "busy", "message": "another fetch of this URL is still running"}))
         try:
-            hit = _from_cache(cache, url, canonical, backend, ttl, newer_than=started)
+            hit = _from_cache(cache, url, canonical, backend, ttl, newer_than=started,
+                              require_live=snapshot_dir is not None)
             if hit:
                 log_event(host=host, backend=hit["backend"], cache="dedup")
                 return fallback(hit)
@@ -124,10 +132,10 @@ async def fetch(url: str, backend: str = "auto", refresh: bool = False, allow_pr
                 lock = pool_fetch_locks.setdefault(id(pool), {}).setdefault(host, asyncio.Lock())
                 async with lock:
                     result = await _fetch_uncached(cache, url, canonical, host, backend, allow_private,
-                                                   jina_key, refresh, pool, max_wait)
+                                                   jina_key, refresh, pool, max_wait, snapshot_dir)
             else:
                 result = await _fetch_uncached(cache, url, canonical, host, backend, allow_private,
-                                               jina_key, refresh, pool, max_wait)
+                                               jina_key, refresh, pool, max_wait, snapshot_dir)
             return fallback(result)
         finally:
             cache.release(url_key)
@@ -137,8 +145,8 @@ async def fetch(url: str, backend: str = "auto", refresh: bool = False, allow_pr
 
 
 def _from_cache(cache: Cache, url: str, canonical: str, backend: str, ttl: float,
-                newer_than: float = 0) -> Optional[dict]:
-    page = cache.get(canonical, backend, ttl, newer_than=newer_than)
+                newer_than: float = 0, require_live: bool = False) -> Optional[dict]:
+    page = None if require_live else cache.get(canonical, backend, ttl, newer_than=newer_than)
     if page:
         return _result(url, final_url=page["final_url"], title=page["title"], backend=page["backend"],
                        cached=True, status=page["status"], content=page["content"])
@@ -163,7 +171,8 @@ async def _acquire_slot(cache: Cache, host: str, backend: str) -> Optional[str]:
 async def _fetch_uncached(cache: Cache, url: str, canonical: str, host: str, backend: str,
                           allow_private: bool, jina_key: Optional[str], refresh: bool,
                           pool: Optional["camoufox_backend.BrowserPool"] = None,
-                          max_wait: float = MAX_POLITE_WAIT) -> dict:
+                          max_wait: float = MAX_POLITE_WAIT,
+                          snapshot_dir: Optional[str] = None) -> dict:
     broken = cache.breaker_wait(host)
     if broken:
         return _result(url, error={"category": "blocked_by_site", "retry_after": round(broken, 1),
@@ -217,7 +226,7 @@ async def _fetch_uncached(cache: Cache, url: str, canonical: str, host: str, bac
                     remaining_wait = max(0, remaining_wait - (time.monotonic() - t_wait))
                 cache.renew(slot, LEASE_SECONDS)
                 cache.renew(f"url:{canonical}", LEASE_SECONDS)
-                outcome = await _attempt(cache, url, canonical, host, name, allow_private, jina_key, refresh, pool)
+                outcome = await _attempt(cache, url, canonical, host, name, allow_private, jina_key, refresh, pool, snapshot_dir)
                 if (name != "browser" or attempt or "url" in outcome or
                         outcome.get("category") in {"blocked_by_site", "blocked_address", "not_found"} or
                         outcome.get("status") in (403, 404) or
@@ -248,7 +257,8 @@ async def _fetch_uncached(cache: Cache, url: str, canonical: str, host: str, bac
 
 async def _attempt(cache: Cache, url: str, canonical: str, host: str, name: str, allow_private: bool,
                    jina_key: Optional[str], refresh: bool,
-                   pool: Optional["camoufox_backend.BrowserPool"] = None) -> dict:
+                   pool: Optional["camoufox_backend.BrowserPool"] = None,
+                   snapshot_dir: Optional[str] = None) -> dict:
     """One backend attempt. Returns a result dict on success, else a failure dict."""
     t0 = time.time()
     raw = None
@@ -257,6 +267,8 @@ async def _attempt(cache: Cache, url: str, canonical: str, host: str, name: str,
             raw = await jina_backend.fetch(canonical, api_key=jina_key, refresh=refresh)
         else:
             extra = {"pool": pool} if pool is not None else {}
+            if snapshot_dir is not None:
+                extra["snapshot"] = True
             raw = await camoufox_backend.fetch(canonical, allow_private=allow_private, **extra)
         title, content = clean_title(raw["title"]), clean_markdown(raw["content"])
         failure = detect_failure(title, content, raw.get("status"), canonical, raw["final_url"],
@@ -265,6 +277,12 @@ async def _attempt(cache: Cache, url: str, canonical: str, host: str, name: str,
             content_failure = detect_failure(title, content, None, canonical, raw["final_url"], min_chars=1)
             if content_failure and content_failure["category"] == "blocked_by_site":
                 failure = content_failure  # challenges are never retried, even on a 5xx page
+        if snapshot_dir is not None and isinstance(raw.get("snapshot_data"), dict):
+            captured = raw["snapshot_data"]
+            snapshot_failure = detect_failure(captured.get("title", ""), captured.get("text", ""),
+                                               raw.get("status"), canonical, raw["final_url"], min_chars=1)
+            if snapshot_failure and snapshot_failure["category"] in {"blocked_by_site", "auth_required"}:
+                failure = snapshot_failure
         if failure is None:
             validate_url(raw["final_url"], allow_private)
     except FetchError as e:
@@ -296,8 +314,18 @@ async def _attempt(cache: Cache, url: str, canonical: str, host: str, name: str,
                 "title": title, "content": content, "fetched_at": time.time()}
         cache.put(page)
         log_event(host=host, backend=name, cache="miss", latency_ms=latency, status=raw.get("status"))
-        return _result(url, final_url=page["final_url"], title=title, backend=name,
-                       status=page["status"], content=content)
+        result = _result(url, final_url=page["final_url"], title=title, backend=name,
+                         status=page["status"], content=content)
+        if snapshot_dir is not None:
+            if not isinstance(raw.get("snapshot_data"), dict):
+                return _result(url, error={"category": "snapshot_error", "message": "browser did not provide snapshot data"})
+            try:
+                saved = save_snapshot(snapshot_dir, url, canonical, raw)
+            except (OSError, UnicodeError, KeyError, TypeError, ValueError) as e:
+                log_event(host=host, backend=name, error="snapshot_error")
+                return _result(url, error={"category": "snapshot_error", "message": f"could not save snapshot: {type(e).__name__}"})
+            result.update(snapshot=saved, snapshotHash=saved["snapshotHash"])
+        return result
 
     if name == "browser" and cache.breaker_wait(host) > 0:
         failure["retry_after"] = round(cache.breaker_wait(host), 1)
@@ -309,7 +337,8 @@ async def _attempt(cache: Cache, url: str, canonical: str, host: str, name: str,
 
 async def fetch_many(urls: list, backend: str = "auto", refresh: bool = False, allow_private: bool = False,
                      jina_key: Optional[str] = None, ttl: float = DEFAULT_TTL,
-                     no_stale: bool = False, max_wait: float = MAX_POLITE_WAIT) -> list:
+                     no_stale: bool = False, max_wait: float = MAX_POLITE_WAIT,
+                     snapshot_dir: Optional[str] = None) -> list:
     """Fetch several URLs in one run, reusing one browser per domain. Results keep input order."""
     cache = Cache(data_dir() / "cache" / "cache.db")
     pool = camoufox_backend.BrowserPool(allow_private)
@@ -319,7 +348,8 @@ async def fetch_many(urls: list, backend: str = "auto", refresh: bool = False, a
     async def one(u):
         async with gate:
             return await fetch(u, backend=backend, refresh=refresh, allow_private=allow_private, cache=cache,
-                               jina_key=jina_key, ttl=ttl, pool=pool, no_stale=no_stale, max_wait=max_wait)
+                               jina_key=jina_key, ttl=ttl, pool=pool, no_stale=no_stale, max_wait=max_wait,
+                               snapshot_dir=snapshot_dir)
 
     try:
         results = dict(zip(unique, await asyncio.gather(*(one(u) for u in unique))))

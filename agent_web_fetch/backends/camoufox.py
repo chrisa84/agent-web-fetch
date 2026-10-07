@@ -349,7 +349,7 @@ class BrowserPool:
         if key:
             self._slot_cache().release(key)
 
-    async def fetch(self, url: str) -> dict:
+    async def fetch(self, url: str, snapshot: bool = False) -> dict:
         exe = installed_executable()
         if not exe:
             raise FetchError("browser_not_installed",
@@ -364,7 +364,8 @@ class BrowserPool:
                 self._slot_cache().renew(key, SLOT_LEASE)
             try:
                 session = await asyncio.wait_for(self._session(host, exe), timeout=HARD_TIMEOUT)
-                return await asyncio.wait_for(_browse(url, session, PlaywrightError), timeout=HARD_TIMEOUT)
+                extra = {"snapshot": True} if snapshot else {}
+                return await asyncio.wait_for(_browse(url, session, PlaywrightError, **extra), timeout=HARD_TIMEOUT)
             except asyncio.TimeoutError:
                 await self.discard(host)
                 raise FetchError("timeout", f"browser fetch exceeded {HARD_TIMEOUT:.0f}s", transient=True)
@@ -384,23 +385,26 @@ class BrowserPool:
             self._cache = None
 
 
-async def fetch(url: str, allow_private: bool = False, pool: Optional[BrowserPool] = None) -> dict:
+async def fetch(url: str, allow_private: bool = False, pool: Optional[BrowserPool] = None,
+                snapshot: bool = False) -> dict:
     """Fetch one page. Without a pool, the browser is launched and closed for this call."""
+    extra = {"snapshot": True} if snapshot else {}
     if pool is not None:
-        return await pool.fetch(url)
+        return await pool.fetch(url, **extra)
     pool = BrowserPool(allow_private)
     try:
-        return await pool.fetch(url)
+        return await pool.fetch(url, **extra)
     finally:
         await pool.close()
 
 
-async def _browse(url: str, session: _Session, PlaywrightError) -> dict:
+async def _browse(url: str, session: _Session, PlaywrightError, snapshot: bool = False) -> dict:
     proxy, guard = session.proxy, session.guard
     proxy.blocked.clear()
     guard.blocked.clear()
     page = await session.context.new_page()
     navigations = []
+    captured = None
 
     def on_response(resp):
         if resp.request.is_navigation_request() and resp.frame == page.main_frame:
@@ -452,6 +456,24 @@ async def _browse(url: str, session: _Session, PlaywrightError) -> dict:
             raise FetchError("rate_limited", "site is rate limiting requests (HTTP 429)", status=429,
                              retry_after=parse_retry_after(await response.header_value("retry-after")))
         final_url = page.url
+        if snapshot:
+            captured = await page.evaluate(SNAPSHOT_JS)
+            if navigations and navigations[-1] is not response:
+                changed = navigations[-1]
+                if changed.headers.get("x-agent-web-fetch") == "blocked-address":
+                    raise FetchError("blocked_address", "page redirected to a non-public address")
+                if changed.status == 429:
+                    raise FetchError("rate_limited", "site is rate limiting requests (HTTP 429)", status=429,
+                                     retry_after=parse_retry_after(await changed.header_value("retry-after")))
+                if changed.status == 403:
+                    raise FetchError("blocked_by_site", "access forbidden (HTTP 403)", status=403)
+                if changed.status in (404, 410):
+                    raise FetchError("not_found", f"page not found (HTTP {changed.status})", status=changed.status)
+            if (captured["final_url"] != final_url or page.url != final_url or
+                    (navigations and navigations[-1] is not response)):
+                raise FetchError("timeout", "page navigated during snapshot capture", transient=True)
+            if not await guard.allowed(captured["final_url"]):
+                raise FetchError("blocked_address", "snapshot URL is not a public address")
     finally:
         try:
             await page.close()
@@ -462,8 +484,11 @@ async def _browse(url: str, session: _Session, PlaywrightError) -> dict:
         final_url = canonicalize(final_url)
     except URLRejected:
         final_url = url
-    return {"final_url": final_url, "title": result.get("title") or "",
-            "content": result.get("markdown") or "", "status": status}
+    raw = {"final_url": final_url, "title": result.get("title") or "",
+           "content": result.get("markdown") or "", "status": status}
+    if captured is not None:
+        raw["snapshot_data"] = captured
+    return raw
 
 
 async def _settle(page) -> None:
@@ -519,3 +544,17 @@ async def _wait_for_challenge(page, result: dict, navigation_error=()) -> dict:
         # Preserve a clear challenge signal even if the title is missing.
         result = dict(result, title="Just a moment")
     return result
+
+
+# Capture HTML and visible body text in one synchronous DOM observation, before
+# the page closes. No content-root selection, cleanup or character cap applies.
+SNAPSHOT_JS = r"""
+() => ({
+  html: (document.doctype ? new XMLSerializer().serializeToString(document.doctype) + "\n" : "") +
+        (document.documentElement ? document.documentElement.outerHTML : ""),
+  text: document.body ? document.body.innerText : "",
+  title: document.title || "",
+  final_url: window.location.href,
+  captured_at: new Date().toISOString()
+})
+"""

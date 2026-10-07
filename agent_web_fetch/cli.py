@@ -43,6 +43,9 @@ def render_markdown(r: dict) -> str:
     head = [f"Source: {r['final_url']}", f"Backend: {r['backend']}" + (" (cached)" if r["cached"] else "")]
     if r.get("stale"):
         head.append(f"Stale: yes (age {r['stale_age_seconds']}s)")
+    if r.get("snapshot"):
+        head.append(f"Snapshot: {r['snapshot']['metadata_path']}")
+        head.append(f"Snapshot SHA-256: {r['snapshotHash']}")
     title = f"# {r['title']}\n\n" if r["title"] else ""
     return "\n".join(head) + f"\n\n{BOUNDARY_BEGIN}\n{title}{r['content']}\n{BOUNDARY_END}\n"
 
@@ -104,6 +107,8 @@ def main(argv=None) -> int:
     p.add_argument("--json", action="store_true", help="emit JSON instead of Markdown")
     p.add_argument("--backend", choices=["auto", "jina", "browser"], default="auto")
     p.add_argument("--refresh", action="store_true", help="bypass the cache")
+    p.add_argument("--snapshot-dir", metavar="PATH",
+                   help="save fresh browser HTML, visible text and hashed metadata to PATH")
     p.add_argument("--no-stale", action="store_true", help="disable fallback to cached pages up to 24 hours old")
     p.add_argument("--max-wait", type=float, default=30, metavar="N",
                    help="maximum seconds to wait on domain holds (default: 30)")
@@ -116,6 +121,8 @@ def main(argv=None) -> int:
 
     if args.max_wait < 0 or not args.max_wait < float("inf"):
         p.error("--max-wait must be finite and non-negative")
+    if args.snapshot_dir is not None and args.backend == "jina":
+        p.error("--snapshot-dir requires the browser; --backend jina is incompatible")
     urls = list(args.urls)
     if args.urls_file:
         src = sys.stdin if args.urls_file == "-" else open(args.urls_file, encoding="utf-8")
@@ -127,7 +134,8 @@ def main(argv=None) -> int:
     from .fetch import fetch, fetch_many
 
     opts = dict(backend=args.backend, refresh=args.refresh, allow_private=args.allow_private_network,
-                jina_key=secrets.get("JINA_API_KEY"), no_stale=args.no_stale, max_wait=args.max_wait)
+                jina_key=secrets.get("JINA_API_KEY"), no_stale=args.no_stale, max_wait=args.max_wait,
+                snapshot_dir=args.snapshot_dir)
     if len(urls) == 1:
         result = limit_content(asyncio.run(fetch(urls[0], **opts)), args.max_chars)
         _write(render_json(result) if args.json else render_markdown(result))
